@@ -82,7 +82,10 @@ class VAE(tf.keras.Model):
         self.encoder = Encoder(latent_dim=self.latent_dim)
         self.decoder = Decoder()
 
-        self.prior = tfd.Normal(loc=0., scale=1.)
+        self.prior_mean = tf.Variable(tf.zeros(latent_dim), name="prior_mean")
+        self.prior_scale = tf.Variable(tf.ones(latent_dim), name="prior_scale")
+
+        self.prior = tfd.Normal(loc=self.prior_mean, scale=self.prior_scale)
 
     def call(self, tensor):
 

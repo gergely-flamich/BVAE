@@ -1,4 +1,5 @@
 import tensorflow as tf
+import tensorflow_probability as tfp
 import tensorflow_datasets as tfds
 
 import datetime
@@ -8,6 +9,7 @@ from sacred import Experiment
 from vae import VAE
 
 tfs = tf.summary
+tfd = tfp.distributions
 
 ex = Experiment("bvae_experiment", ingredients=[])
 
@@ -28,7 +30,7 @@ def config():
     learning_rate = 1e-3
 
     # Latent dimensions of the VAE
-    latent_dim = 50
+    latent_dim = 10
 
     # Logging
     tensorboard_log_freq = 1000
@@ -99,6 +101,13 @@ def train(model_save_dir,
     # Training Loop
     # -------------------------------------------------------------------------
 
+    # Restore previous session
+    ckpt.restore(manager.latest_checkpoint)
+    if manager.latest_checkpoint:
+        _log.info(f"Restored model from {manager.latest_checkpoint}")
+    else:
+        _log.info("Initializing model from scratch.")
+
     def train_step(model, batch):
 
         with tf.GradientTape() as tape:
@@ -116,6 +125,8 @@ def train(model_save_dir,
 
     for batch in train_data:
 
+        ckpt.step.assign_add(1)
+
         reconstructions, likelihood, kl_divergence = train_step(model, batch)
 
         if int(ckpt.step) % tensorboard_log_freq == 0:
@@ -123,13 +134,18 @@ def train(model_save_dir,
             save_path = manager.save()
             _log.info(f"Step {int(ckpt.step)}: Saved model to {save_path}")
 
+            individual_kls = tf.reduce_mean(tfd.kl_divergence(model.posterior, model.prior), axis=0)
+
             with summary_writer.as_default():
                 tfs.scalar(name="Likelihood", data=likelihood, step=ckpt.step)
-                tfs.scalar(name="KL", data=kl_divergence, step=ckpt.step)
+                tfs.scalar(name="Total_KL", data=kl_divergence, step=ckpt.step)
                 tfs.scalar(name="ELBO", data=likelihood + kl_divergence, step=ckpt.step)
 
                 tfs.image(name="Original", data=batch, step=ckpt.step)
                 tfs.image(name="Reconstruction", data=reconstructions, step=ckpt.step)
+
+                for i, kl in enumerate(individual_kls):
+                    tfs.scalar(f"KL/dim_{i}", data=kl, step=ckpt.step)
 
 
 
