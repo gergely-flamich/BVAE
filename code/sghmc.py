@@ -27,7 +27,7 @@ class SGHMC(tf.optimizers.Optimizer):
 
     def _create_slots(self, var_list):
         for var in var_list:
-            self.add_slot(var, "momentum", initializer=tf.random_normal_initializer(stddev=1.))
+            self.add_slot(var, "momentum")
 
     def _resource_apply_dense(self, grad, var, apply_state=None):
 
@@ -51,12 +51,13 @@ class SGHMC(tf.optimizers.Optimizer):
         # Scale the gradient according to the data size
         scaled_grad = grad * tf.cast(self._data_size, grad.dtype)
 
-        noise_stddev = tf.sqrt(self._learning_rate * self._momentum_decay)
+        noise_stddev = tf.sqrt(2. * self._learning_rate * self._momentum_decay)
         momentum_noise = tf.random.normal(shape=scaled_grad.shape, dtype=scaled_grad.dtype)
+        momentum_noise = noise_stddev * momentum_noise
 
-        momentum_delta = -0.5 * self._momentum_decay * momentum + \
+        momentum_delta = -self._momentum_decay * momentum + \
                          self._learning_rate * scaled_grad + \
-                         noise_stddev * momentum_noise
+                         momentum_noise
 
         new_variable = variable + momentum
         new_momentum = momentum + momentum_delta

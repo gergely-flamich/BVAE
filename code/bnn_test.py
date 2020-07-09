@@ -8,6 +8,7 @@ from sacred import Experiment
 
 from bnn import BNN
 from adaptive_sghmc import AdaptiveSGHMC
+from sghmc import SGHMC
 
 tfs = tf.summary
 tfd = tfp.distributions
@@ -22,19 +23,22 @@ def config():
     data_dir = "/scratch/gf332/Misc/datasets/"
     model_base_save_dir = "/scratch/gf332/Misc/bnn_experiments"
 
+    optimizer = "adaptive_sghmc"
+
     batch_size = 500
     burnin_epochs = 50
 
     dataset_size = 60000
 
     # Gradient descent Optimizer
-    iterations = 100000
-    learning_rate = 1e-2
+    iterations = 1000
+    learning_rate = 1e-3
+    momentum_decay = 5e-2
 
     # Logging
     tensorboard_log_freq = 100
 
-    model_save_dir = f"{model_base_save_dir}/bnn"
+    model_save_dir = f"{model_base_save_dir}/bnn/{optimizer}"
 
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = f"{model_save_dir}/logs/{current_time}/train"
@@ -45,7 +49,9 @@ def train(model_save_dir,
           data_dir,
           dataset_size,
 
+          optimizer,
           batch_size,
+          momentum_decay,
           burnin_epochs,
 
           iterations,
@@ -81,10 +87,15 @@ def train(model_save_dir,
 
     learning_rate = tf.Variable(learning_rate, dtype=tf.float32, name="learn_rate")
 
-    optimizer = AdaptiveSGHMC(learning_rate=learning_rate,
-                              burnin=num_batch_per_epoch * burnin_epochs,
-                              data_size=dataset_size,
-                              momentum_decay=0.05)
+    optimizer = {
+        "adaptive_sghmc": AdaptiveSGHMC(learning_rate=learning_rate,
+                                        burnin=num_batch_per_epoch * burnin_epochs,
+                                        data_size=dataset_size,
+                                        momentum_decay=momentum_decay),
+        "sghmc": SGHMC(learning_rate=learning_rate,
+                       data_size=dataset_size,
+                       momentum_decay=momentum_decay)
+    }[optimizer]
 
     ckpt = tf.train.Checkpoint(step=tf.Variable(1, dtype=tf.int64),
                                learning_rate=learning_rate,
@@ -114,7 +125,7 @@ def train(model_save_dir,
         with tf.GradientTape() as tape:
             probabilities = model(batch)
 
-            log_likelihood = tf.reduce_mean(labels * tf.math.log(probabilities))
+            log_likelihood = tf.reduce_mean(labels * tf.math.log(probabilities + 1e-16))
 
             prior_log_prob = model.weight_prior_log_prob() / tf.cast(dataset_size, tf.float32)
             hyper_prior_log_prob = model._hyperprior_log_prob / tf.cast(dataset_size, tf.float32)
@@ -125,11 +136,12 @@ def train(model_save_dir,
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
         if any(tf.reduce_any(tf.math.is_nan(grad)) for grad in gradients):
-            raise ValueError(f"Gradient exploded: LL: {log_likelihood}, Prior LL: {prior_log_prob}, Hyperprior LL: {hyper_prior_log_prob}")
+            raise ValueError(
+                f"Gradient exploded: LL: {log_likelihood}, Prior LL: {prior_log_prob}, Hyperprior LL: {hyper_prior_log_prob}")
 
         return probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob
 
-    for batch, labels in train_data:
+    for batch, labels in train_data.take(iterations):
 
         # Resample scale hyperparameters every epoch
         if int(ckpt.step) % num_batch_per_epoch == 0:
@@ -139,7 +151,8 @@ def train(model_save_dir,
 
         ckpt.step.assign_add(1)
 
-        probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob = train_step(model, batch, tf.one_hot(labels, depth=10))
+        probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob = train_step(model, batch,
+                                                                                         tf.one_hot(labels, depth=10))
 
         prediction = tf.argmax(probabilities, axis=1)
 
