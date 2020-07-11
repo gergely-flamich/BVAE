@@ -56,7 +56,7 @@ class SGHMC(tf.optimizers.Optimizer):
         momentum_noise = noise_stddev * momentum_noise
 
         momentum_delta = -self._momentum_decay * momentum + \
-                         self._learning_rate * scaled_grad + \
+                         -self._learning_rate * scaled_grad + \
                          momentum_noise
 
         new_variable = variable + momentum

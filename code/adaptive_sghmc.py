@@ -88,59 +88,76 @@ class AdaptiveSGHMC(tf.optimizers.Optimizer):
         # the preconditioner,
         # the the exponentail averaging coefficient
         # the gradient noise
-        burnin_update_ops = []
-        if int(self.iterations) < self._burnin:
+        deltas = tf.cond(self.iterations < self._burnin,
+                         true_fn=lambda: self._burnin_hyperparameter_deltas(scaled_grad=scaled_grad,
+                                                                            exponential_average_coeff=exponential_average_coeff,
+                                                                            smoothed_gradient=smoothed_gradient,
+                                                                            squared_grad_magnitude=squared_grad_magnitude,
+                                                                            epsilon=epsilon),
+                         false_fn=lambda: (0., 0., 0.))
 
-            ea_coeff_inv = 1. / (exponential_average_coeff + 1.)
+        delta_ea_coeff, delta_smoothed_gradient, delta_squared_grad_magnitude = deltas
 
-            # Tau delta
-            delta_ea_coeff = tf.square(smoothed_gradient) / (squared_grad_magnitude + epsilon)
-            delta_ea_coeff = -exponential_average_coeff * delta_ea_coeff + 1.
+        new_ea = exponential_average_coeff + delta_ea_coeff
+        new_smoothed_grad = smoothed_gradient + delta_smoothed_gradient
+        new_squared_grad_magnitude = squared_grad_magnitude + delta_squared_grad_magnitude
 
-            # g delta
-            delta_smoothed_gradient = ea_coeff_inv * (-smoothed_gradient + scaled_grad)
+        exponential_average_coeff.assign(new_ea)
+        smoothed_gradient.assign(new_smoothed_grad)
+        squared_grad_magnitude.assign(new_squared_grad_magnitude)
 
-            # Preconditioner (V_theta) delta
-            delta_squared_grad_magnitude = ea_coeff_inv * (-squared_grad_magnitude + tf.square(scaled_grad))
+        # ----------------------------
+        # Actual SGHMC step
+        # ----------------------------
 
-            burnin_update_ops = [
-                exponential_average_coeff.assign_add(delta_ea_coeff).op,
-                smoothed_gradient.assign_add(delta_smoothed_gradient).op,
-                squared_grad_magnitude.assign_add(delta_squared_grad_magnitude).op
-            ]
+        grad_magnitude = tf.sqrt(squared_grad_magnitude)
 
-        with tf.control_dependencies(burnin_update_ops):
+        preconditioner = 1. / (grad_magnitude + epsilon)
 
-            grad_magnitude = tf.sqrt(squared_grad_magnitude)
+        # Note the assumption that momentum_decay = learning_rate * precondtioner^-1 * C
+        noise_variance = 2. * preconditioner * self._momentum_decay - self._learning_rate ** 2
+        noise_stddev = self._learning_rate * tf.sqrt(tf.maximum(noise_variance, 1e-16))
 
-            preconditioner = 1. / (grad_magnitude + epsilon)
+        momentum_noise = tf.random.normal(shape=scaled_grad.shape, dtype=scaled_grad.dtype)
+        momentum_noise = noise_stddev * momentum_noise
 
-            # Note the assumption that momentum_decay = learning_rate * precondtioner^-1 * C
-            noise_variance = 2. * preconditioner * self._momentum_decay - self._learning_rate ** 2
-            noise_stddev = self._learning_rate * tf.sqrt(tf.maximum(noise_variance, 1e-16))
+        momentum_delta = -self._momentum_decay * momentum + \
+                         -self._learning_rate ** 2 * preconditioner * scaled_grad + \
+                         momentum_noise
 
-            momentum_noise = tf.random.normal(shape=scaled_grad.shape, dtype=scaled_grad.dtype)
-            momentum_noise = noise_stddev * momentum_noise
+        new_variable = variable + momentum
+        new_momentum = momentum + momentum_delta
 
-            momentum_delta = -self._momentum_decay * momentum + \
-                             self._learning_rate ** 2 * preconditioner * scaled_grad + \
-                             momentum_noise
+        # Dense moment update
+        if indices is None:
+            # Note the minus sign on the delta argument. This is because we wish to perform gradient ascent.
+            variable.assign(new_variable)
+            momentum.assign(new_momentum)
 
-            new_variable = variable + momentum
-            new_momentum = momentum + momentum_delta
+        else:
+            self._resource_scatter_update(variable, indices, new_variable)
+            self._resource_scatter_update(momentum, indices, new_momentum)
 
-            # Dense moment update
-            if indices is None:
-                # Note the minus sign on the delta argument. This is because we wish to perform gradient ascent.
-                update_ops = [
-                    variable.assign(new_variable).op,
-                    momentum.assign(new_momentum).op
-                ]
+        # https://github.com/tensorflow/tensorflow/issues/30711#issuecomment-512921409
+        return []
 
-            else:
-                update_ops = [
-                    self._resource_scatter_update(variable, indices, new_variable),
-                    self._resource_scatter_update(momentum, indices, new_momentum)
-                ]
+    def _burnin_hyperparameter_deltas(self,
+                                      scaled_grad,
+                                      exponential_average_coeff,
+                                      smoothed_gradient,
+                                      squared_grad_magnitude,
+                                      epsilon=1e-16):
 
-            return tf.group(update_ops)
+        ea_coeff_inv = 1. / (exponential_average_coeff + 1.)
+
+        # Tau delta
+        delta_ea_coeff = tf.square(smoothed_gradient) / (squared_grad_magnitude + epsilon)
+        delta_ea_coeff = -exponential_average_coeff * delta_ea_coeff + 1.
+
+        # g delta
+        delta_smoothed_gradient = ea_coeff_inv * (-smoothed_gradient + scaled_grad)
+
+        # Preconditioner (V_theta) delta
+        delta_squared_grad_magnitude = ea_coeff_inv * (-squared_grad_magnitude + tf.square(scaled_grad))
+
+        return delta_ea_coeff, delta_smoothed_gradient, delta_squared_grad_magnitude

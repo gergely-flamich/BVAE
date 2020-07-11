@@ -6,7 +6,7 @@ import datetime
 
 from sacred import Experiment
 
-from bnn import BNN
+from bnn import MnistBNN
 from adaptive_sghmc import AdaptiveSGHMC
 from sghmc import SGHMC
 
@@ -16,6 +16,9 @@ tfd = tfp.distributions
 tfl = tf.keras.layers
 
 ex = Experiment("bvae_experiment", ingredients=[])
+
+# Set CPU as available physical device
+tf.config.experimental.set_visible_devices([], 'GPU')
 
 
 @ex.config
@@ -81,7 +84,7 @@ def train(model_save_dir,
     # Create model
     # -------------------------------------------------------------------------
 
-    model = BNN()
+    model = MnistBNN()
 
     model.build(input_shape=(batch_size, 28, 28, 1))
 
@@ -120,39 +123,38 @@ def train(model_save_dir,
     else:
         _log.info("Initializing model from scratch.")
 
+    @tf.function
     def train_step(model, batch, labels):
+
+        if int(ckpt.step) % num_batch_per_epoch == 0:
+            model.resample_weight_prior_parameters()
 
         with tf.GradientTape() as tape:
             probabilities = model(batch)
 
-            log_likelihood = tf.reduce_mean(labels * tf.math.log(probabilities + 1e-16))
+            log_likelihood = tf.reduce_mean(labels * tf.math.log(probabilities + 1e-10))
 
             prior_log_prob = model.weight_prior_log_prob() / tf.cast(dataset_size, tf.float32)
-            hyper_prior_log_prob = model._hyperprior_log_prob / tf.cast(dataset_size, tf.float32)
+            hyper_prior_log_prob = model.hyperprior_log_prob() / tf.cast(dataset_size, tf.float32)
 
-            joint_log_likelihood = log_likelihood + prior_log_prob + hyper_prior_log_prob
+            # Negative joint log likelihood
+            loss = -(log_likelihood + prior_log_prob + hyper_prior_log_prob)
 
-        gradients = tape.gradient(joint_log_likelihood, model.trainable_variables)
+        gradients = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-        if any(tf.reduce_any(tf.math.is_nan(grad)) for grad in gradients):
-            raise ValueError(
-                f"Gradient exploded: LL: {log_likelihood}, Prior LL: {prior_log_prob}, Hyperprior LL: {hyper_prior_log_prob}")
+        # if any(tf.reduce_any(tf.math.is_nan(grad)) for grad in gradients):
+        #     raise ValueError(
+        #         f"Gradient exploded: LL: {log_likelihood}, Prior LL: {prior_log_prob}, Hyperprior LL: {hyper_prior_log_prob}")
 
         return probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob
 
     for batch, labels in train_data.take(iterations):
 
-        # Resample scale hyperparameters every epoch
-        if int(ckpt.step) % num_batch_per_epoch == 0:
-            _log.info("Resampling hyperparameters!")
-
-            model.resample_weight_prior_parameters()
-
-        ckpt.step.assign_add(1)
-
         probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob = train_step(model, batch,
                                                                                          tf.one_hot(labels, depth=10))
+
+        ckpt.step.assign_add(1)
 
         prediction = tf.argmax(probabilities, axis=1)
 
