@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.python.training import training_ops
+from functools import partial
 
 
 class AdaptiveSGHMC(tf.optimizers.Optimizer):
@@ -8,9 +8,16 @@ class AdaptiveSGHMC(tf.optimizers.Optimizer):
     (beta_hat in the original paper) is set to 0.
     """
 
+    _MOMENTUM_NAME = "momentum"
+    _SQUARED_GRAD_NAME = "squared_grad"
+    _SMOOTH_GRAD_NAME = "smooth_grad"
+    _TAU_NAME = "tau"
+
     def __init__(self,
                  learning_rate,
                  burnin,
+                 initialization_rounds=10,
+                 overestimation_rate=1000.,
                  data_size=1,
                  momentum_decay=0.01,
                  name="AdaptiveSGHMC",
@@ -22,7 +29,17 @@ class AdaptiveSGHMC(tf.optimizers.Optimizer):
             self._data_size = tf.convert_to_tensor(data_size, name="data_size", dtype=tf.int64)
             self._momentum_decay = tf.convert_to_tensor(momentum_decay, name="momentum_decay", )
 
-            self._friction = tf.Variable(0., name="friction")
+            self._initialization_rounds = tf.convert_to_tensor(initialization_rounds,
+                                                               name="initialization_rounds",
+                                                               dtype=tf.int64)
+
+            self._overestimation_rate = tf.convert_to_tensor(overestimation_rate,
+                                                             name="overestimation_rate",
+                                                             dtype=tf.float32)
+
+            self._learning_rate_squared = self._learning_rate ** 2.
+
+            self.eps = 1e-6
 
             super().__init__(name=name, **kwargs)
 
@@ -31,104 +48,151 @@ class AdaptiveSGHMC(tf.optimizers.Optimizer):
 
     def _create_slots(self, var_list):
         for var in var_list:
-            self.add_slot(var, "momentum")
+            self.add_slot(var, self._MOMENTUM_NAME, initializer="zeros")
 
             # V_hat
-            self.add_slot(var, "squared_grad_magnitude", initializer="ones")
+            self.add_slot(var, self._SQUARED_GRAD_NAME, initializer="ones")
 
             # g
-            self.add_slot(var, "smoothed_gradient", initializer="ones")
+            self.add_slot(var, self._SMOOTH_GRAD_NAME, initializer="ones")
 
-            # tau
-            self.add_slot(var, "exponential_average_coeff", initializer="ones")
+            # exponential average coefficient
+            self.add_slot(var, self._TAU_NAME, initializer="ones")
 
     def _resource_apply_dense(self, grad, var, apply_state=None):
 
-        momentum = self.get_slot(var, "momentum")
-        squared_grad_magnitude = self.get_slot(var, "squared_grad_magnitude")
-        smoothed_gradient = self.get_slot(var, "smoothed_gradient")
-        exponential_average_coeff = self.get_slot(var, "exponential_average_coeff")
+        momentum = self.get_slot(var, self._MOMENTUM_NAME)
+        squared_grad = self.get_slot(var, self._SQUARED_GRAD_NAME)
+        smooth_grad = self.get_slot(var, self._SMOOTH_GRAD_NAME)
+        tau = self.get_slot(var, self._TAU_NAME)
 
-        return self._sghmc_step(grad=grad,
+        return self._sghmc_step(batch_grad=grad,
                                 variable=var,
                                 momentum=momentum,
-                                squared_grad_magnitude=squared_grad_magnitude,
-                                smoothed_gradient=smoothed_gradient,
-                                exponential_average_coeff=exponential_average_coeff)
+                                squared_grad=squared_grad,
+                                smooth_grad=smooth_grad,
+                                tau=tau)
 
     def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
 
-        momentum = self.get_slot(var, "momentum")
-        squared_grad_magnitude = self.get_slot(var, "squared_grad_magnitude")
-        smoothed_gradient = self.get_slot(var, "smoothed_gradient")
-        exponential_average_coeff = self.get_slot(var, "exponential_average_coeff")
+        momentum = self.get_slot(var, self._MOMENTUM_NAME)
+        squared_grad = self.get_slot(var, self._SQUARED_GRAD_NAME)
+        smooth_grad = self.get_slot(var, self._SMOOTH_GRAD_NAME)
+        tau = self.get_slot(var, self._TAU_NAME)
 
-        return self._sghmc_step(grad=grad,
+        return self._sghmc_step(batch_grad=grad,
                                 variable=var,
                                 momentum=momentum,
-                                squared_grad_magnitude=squared_grad_magnitude,
-                                smoothed_gradient=smoothed_gradient,
-                                exponential_average_coeff=exponential_average_coeff,
+                                squared_grad=squared_grad,
+                                smooth_grad=smooth_grad,
+                                tau=tau,
                                 indices=indices)
 
     def _sghmc_step(self,
-                    grad,
+                    batch_grad,
                     variable,
                     momentum,
-                    squared_grad_magnitude,
-                    smoothed_gradient,
-                    exponential_average_coeff,
-                    epsilon=1e-16,
+                    squared_grad,
+                    smooth_grad,
+                    tau,
                     indices=None):
 
         # Scale the gradient according to the data size
-        scaled_grad = grad * tf.cast(self._data_size, grad.dtype)
+        batch_grad = batch_grad * tf.cast(self._data_size, batch_grad.dtype)
 
+        # ---------------------------------------------------------------------
+        # Hyper-parameter adaptation based on the paper "No more pesky learning rates"
+        # ---------------------------------------------------------------------
+
+        # Compute average over the first few iterations
+        # if self.iterations < self._initialization_rounds:
+        #     smooth_grad.assign_add(batch_grad)
+        #     squared_grad.assign_add(tf.square(batch_grad))
+
+        update_val = tf.cond(self.iterations < self._initialization_rounds,
+                             true_fn=lambda: batch_grad,
+                             false_fn=lambda: 0.)
+
+        init_smooth_grad = smooth_grad + update_val
+        init_squared_grad = squared_grad + tf.square(update_val)
+
+        smooth_grad.assign(init_smooth_grad)
+        squared_grad.assign(init_squared_grad)
+
+        def average_initial_vals():
+            n0 = tf.cast(self._initialization_rounds, batch_grad.dtype)
+            c = tf.cast(self._overestimation_rate, batch_grad.dtype)
+
+            tf.print("SGHMC hyperparameters initialized!") #, tf.reduce_max(tf.square(smooth_grad / n0) - squared_grad / n0 * c))
+
+            return (
+                smooth_grad / n0,
+                (squared_grad / n0) * c,
+                n0 * tf.ones_like(tau)
+            )
+
+        init_vals = tf.cond(self.iterations == self._initialization_rounds,
+                            true_fn=average_initial_vals,
+                            false_fn=lambda: (smooth_grad, squared_grad, tau))
+
+        init_smooth_grad, init_squared_grad, init_tau = init_vals
+
+        smooth_grad.assign(init_smooth_grad)
+        squared_grad.assign(init_squared_grad)
+        tau.assign(init_tau)
+
+        # ---------------------------------------------------------------------
+        # Optimizer hyper-parameter adaptation during burn-in
+        # ---------------------------------------------------------------------
         # If we are still in the burn-in phase, adapt:
         # the preconditioner,
         # the the exponentail averaging coefficient
         # the gradient noise
-        deltas = tf.cond(self.iterations < self._burnin,
-                         true_fn=lambda: self._burnin_hyperparameter_deltas(scaled_grad=scaled_grad,
-                                                                            exponential_average_coeff=exponential_average_coeff,
-                                                                            smoothed_gradient=smoothed_gradient,
-                                                                            squared_grad_magnitude=squared_grad_magnitude,
-                                                                            epsilon=epsilon),
+        calculate_deltas = partial(self._burnin_hyperparameter_deltas,
+                                   batch_grad=batch_grad,
+                                   tau=tau,
+                                   smooth_grad=smooth_grad,
+                                   squared_grad=squared_grad)
+
+        deltas = tf.cond(tf.logical_and(self._initialization_rounds < self.iterations,
+                                        self.iterations < self._burnin),
+
+                         true_fn=calculate_deltas,
+
                          false_fn=lambda: (0., 0., 0.))
 
-        delta_ea_coeff, delta_smoothed_gradient, delta_squared_grad_magnitude = deltas
+        delta_tau, delta_smooth_grad, delta_squared_grad = deltas
 
-        new_ea = exponential_average_coeff + delta_ea_coeff
-        new_smoothed_grad = smoothed_gradient + delta_smoothed_gradient
-        new_squared_grad_magnitude = squared_grad_magnitude + delta_squared_grad_magnitude
+        new_tau = tau + delta_tau
+        new_smooth_grad = smooth_grad + delta_smooth_grad
+        new_squared_grad = squared_grad + delta_squared_grad
 
-        exponential_average_coeff.assign(new_ea)
-        smoothed_gradient.assign(new_smoothed_grad)
-        squared_grad_magnitude.assign(new_squared_grad_magnitude)
+        # Simultaneous update to optimizer hyper-parameters
+        tau.assign(new_tau)
+        smooth_grad.assign(new_smooth_grad)
+        squared_grad.assign(new_squared_grad)
 
-        # ----------------------------
+        # ---------------------------------------------------------------------
         # Actual SGHMC step
-        # ----------------------------
-
-        grad_magnitude = tf.sqrt(squared_grad_magnitude)
-
-        preconditioner = 1. / (grad_magnitude + epsilon)
+        # ---------------------------------------------------------------------
+        preconditioner = 1. / tf.sqrt(squared_grad + 1e-16)
 
         # Note the assumption that momentum_decay = learning_rate * precondtioner^-1 * C
-        noise_variance = 2. * preconditioner * self._momentum_decay - self._learning_rate ** 2
-        noise_stddev = self._learning_rate * tf.sqrt(tf.maximum(noise_variance, 1e-16))
+        noise_variance = 2. * preconditioner * self._momentum_decay - self._learning_rate_squared
+        noise_variance = self._learning_rate * tf.maximum(noise_variance, 1e-16)
 
-        momentum_noise = tf.random.normal(shape=scaled_grad.shape, dtype=scaled_grad.dtype)
+        noise_stddev = tf.sqrt(noise_variance)
+
+        momentum_noise = tf.random.normal(shape=batch_grad.shape, dtype=batch_grad.dtype)
         momentum_noise = noise_stddev * momentum_noise
 
         momentum_delta = -self._momentum_decay * momentum + \
-                         -self._learning_rate ** 2 * preconditioner * scaled_grad + \
+                         -self._learning_rate_squared * preconditioner * batch_grad + \
                          momentum_noise
 
-        new_variable = variable + momentum
         new_momentum = momentum + momentum_delta
+        new_variable = variable + new_momentum
 
-        # Dense moment update
         if indices is None:
             # Note the minus sign on the delta argument. This is because we wish to perform gradient ascent.
             variable.assign(new_variable)
@@ -142,22 +206,25 @@ class AdaptiveSGHMC(tf.optimizers.Optimizer):
         return []
 
     def _burnin_hyperparameter_deltas(self,
-                                      scaled_grad,
-                                      exponential_average_coeff,
-                                      smoothed_gradient,
-                                      squared_grad_magnitude,
-                                      epsilon=1e-16):
+                                      batch_grad,
+                                      tau,
+                                      smooth_grad,
+                                      squared_grad,
+                                      tau_eps=1e-6):
 
-        ea_coeff_inv = 1. / (exponential_average_coeff + 1.)
+        # tf.print("Iter:", self.iterations, "Min EA:", tf.reduce_min(tau),
+        #          "Max SG:", tf.reduce_max(smooth_grad), "Max SGM: ", tf.reduce_max(squared_grad), "Grad",
+        #          tf.reduce_max(batch_grad))
 
         # Tau delta
-        delta_ea_coeff = tf.square(smoothed_gradient) / (squared_grad_magnitude + epsilon)
-        delta_ea_coeff = -exponential_average_coeff * delta_ea_coeff + 1.
+        delta_tau = -tau * (tf.square(smooth_grad) / (squared_grad + self.eps)) + 1.
+
+        tau_inv = 1. / (tau + tau_eps)
 
         # g delta
-        delta_smoothed_gradient = ea_coeff_inv * (-smoothed_gradient + scaled_grad)
+        delta_smooth_grad = tau_inv * (-smooth_grad + batch_grad)
 
-        # Preconditioner (V_theta) delta
-        delta_squared_grad_magnitude = ea_coeff_inv * (-squared_grad_magnitude + tf.square(scaled_grad))
+        # V_theta delta
+        delta_squared_grad = tau_inv * (-squared_grad + tf.square(batch_grad))
 
-        return delta_ea_coeff, delta_smoothed_gradient, delta_squared_grad_magnitude
+        return delta_tau, delta_smooth_grad, delta_squared_grad

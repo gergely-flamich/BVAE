@@ -1,6 +1,8 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+from dense_with_prior import GaussianDenseWithGammaPrior
+
 tfd = tfp.distributions
 tfl = tf.keras.layers
 
@@ -38,7 +40,6 @@ class DummyBNN(tf.keras.Model):
             self.transform_variables += layer.trainable_variables
 
         for var in self.transform_variables:
-
             self.num_weight_params += tf.size(var)
 
             weight_prior = tfd.Independent(distribution=tfd.Normal(loc=tf.zeros_like(var),
@@ -74,62 +75,49 @@ class DummyBNN(tf.keras.Model):
 class MnistBNN(tf.keras.Model):
 
     def __init__(self,
+                 prior_mode,
                  name="bnn",
                  **kwargs):
 
         super().__init__(name=name, **kwargs)
 
+        self.prior_mode = prior_mode
+
         self.transforms = [
             tfl.Reshape((28 * 28,)),
-            tfl.Dense(units=100,
-                      activation=tf.nn.sigmoid),
-            tfl.Dense(units=10,
-                      activation=tf.nn.softmax)
+            GaussianDenseWithGammaPrior(units=100,
+                                        prior_mode=self.prior_mode,
+                                        activation=tf.nn.sigmoid),
+            GaussianDenseWithGammaPrior(units=10,
+                                        prior_mode=self.prior_mode)
         ]
 
-        self.weight_priors = []
-
-
     def resample_weight_prior_parameters(self):
-        """
-        Performs a Gibbs step to sample from the hyperposterior
-        :return:
-        """
 
-        # Update the scale distributions
-        for var, concentration, rate, prec_hyper_dist, weight_prior_scale in zip(self.trainable_variables,
-                                                                                 self._weight_prec_hyperprior_concentrations,
-                                                                                 self._weight_prec_hyperprior_rates,
-                                                                                 self.weight_precision_hyper_distributions,
-                                                                                 self.weight_prior_scales):
-            concentration.assign(concentration + 0.5)
-            rate.assign(rate + 0.5 * tf.square(var))
-
-            precision_sample = prec_hyper_dist.sample()
-
-            weight_prior_scale.assign(self.precision_to_scale(precision_sample))
+        for layer in self.transforms[1:]:
+            layer.resample_precisions()
 
     def weight_prior_log_prob(self):
 
         prior_log_prob = 0.
+        num_params = 0
 
-        for var, weight_prior in zip(self.trainable_variables, self.weight_priors):
-            prior_log_prob = prior_log_prob + weight_prior.log_prob(var)
+        for layer in self.transforms[1:]:
+            prior_log_prob += layer.weight_log_prob()
+            num_params += layer.num_params
 
-        return prior_log_prob
+        return prior_log_prob / tf.cast(num_params, tf.float32)
 
-    def hyperprior_log_prob(self):
+    def hyper_prior_log_prob(self):
 
-        hyperprior_log_prob = 0.
+        hyperprior_log_prob = self.transforms[1].hyper_prior_log_prob()
+        num_params = 0
 
-        for stddev, precision_prior in zip(self.weight_prior_scales, self.weight_precision_hyper_distributions):
-            hyperprior_log_prob += precision_prior.log_prob(1. / tf.square(stddev))
+        for layer in self.transforms[1:]:
+            hyperprior_log_prob += layer.hyper_prior_log_prob()
+            num_params += layer.num_params
 
-        return hyperprior_log_prob
-
-    def precision_to_scale(self, prec, eps=1e-6):
-
-        return 1. / (tf.sqrt(tf.maximum(prec, eps)) + eps)
+        return hyperprior_log_prob / tf.cast(num_params, tf.float32)
 
     def get_weights(self):
         return [var.value() for var in self.trainable_variables]
@@ -138,52 +126,9 @@ class MnistBNN(tf.keras.Model):
         for var, weight in zip(self.trainable_variables, weights):
             var.assign(weight)
 
-    def build(self, input_shape):
-
-        super().build(input_shape)
-
-        self._weight_prec_hyperprior_concentrations = []
-        self._weight_prec_hyperprior_rates = []
-
-        self.weight_precision_hyper_distributions = []
-
-        self.weight_prior_scales = []
-        self.weight_priors = []
-
-        for var in self.trainable_variables:
-            concentration = tf.Variable(tf.ones_like(var),
-                                        name=f"{var.name}/prec_hyperprior_concentration",
-                                        trainable=False)
-
-            rate = tf.Variable(tf.ones_like(var),
-                               name=f"{var.name}/prec_hyperprior_rate",
-                               trainable=False)
-
-            prec_hyperprior = tfd.Independent(distribution=tfd.Gamma(concentration=concentration, rate=rate),
-                                              reinterpreted_batch_ndims=tf.rank(concentration))
-
-            precision_sample = prec_hyperprior.sample()
-
-            weight_prior_scale = tf.Variable(self.precision_to_scale(precision_sample),
-                                             name=f"{var.name}/prior_scale",
-                                             trainable=False)
-
-            weight_prior = tfd.Independent(distribution=tfd.Normal(loc=0., scale=weight_prior_scale),
-                                           reinterpreted_batch_ndims=tf.rank(concentration))
-
-            self._weight_prec_hyperprior_concentrations.append(concentration)
-            self._weight_prec_hyperprior_rates.append(rate)
-            self.weight_precision_hyper_distributions.append(prec_hyperprior)
-
-            self.weight_prior_scales.append(weight_prior_scale)
-            self.weight_priors.append(weight_prior)
-
-    def call(self, inputs, training=None, mask=None):
-
-        tensor = inputs
+    def call(self, tensor):
 
         for layer in self.transforms:
             tensor = layer(tensor)
 
         return tensor
-

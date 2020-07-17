@@ -28,6 +28,10 @@ def config():
 
     optimizer = "adaptive_sghmc"
 
+    prior_mode = "per_unit"
+
+    overestimation_rate = 1e5
+
     batch_size = 500
     burnin_epochs = 50
 
@@ -52,6 +56,9 @@ def train(model_save_dir,
           data_dir,
           dataset_size,
 
+          prior_mode,
+
+          overestimation_rate,
           optimizer,
           batch_size,
           momentum_decay,
@@ -84,7 +91,7 @@ def train(model_save_dir,
     # Create model
     # -------------------------------------------------------------------------
 
-    model = MnistBNN()
+    model = MnistBNN(prior_mode=prior_mode)
 
     model.build(input_shape=(batch_size, 28, 28, 1))
 
@@ -94,6 +101,7 @@ def train(model_save_dir,
         "adaptive_sghmc": AdaptiveSGHMC(learning_rate=learning_rate,
                                         burnin=num_batch_per_epoch * burnin_epochs,
                                         data_size=dataset_size,
+                                        overestimation_rate=overestimation_rate,
                                         momentum_decay=momentum_decay),
         "sghmc": SGHMC(learning_rate=learning_rate,
                        data_size=dataset_size,
@@ -127,32 +135,29 @@ def train(model_save_dir,
     def train_step(model, batch, labels):
 
         if int(ckpt.step) % num_batch_per_epoch == 0:
+            tf.print("Resampling weight scales!")
             model.resample_weight_prior_parameters()
 
         with tf.GradientTape() as tape:
-            probabilities = model(batch)
+            logits = model(batch)
 
-            log_likelihood = tf.reduce_mean(labels * tf.math.log(probabilities + 1e-10))
+            log_likelihood = -tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits))
 
             prior_log_prob = model.weight_prior_log_prob() / tf.cast(dataset_size, tf.float32)
-            hyper_prior_log_prob = model.hyperprior_log_prob() / tf.cast(dataset_size, tf.float32)
+
+            hyperprior_log_prob = model.hyper_prior_log_prob() / tf.cast(dataset_size, tf.float32)
 
             # Negative joint log likelihood
-            loss = -(log_likelihood + prior_log_prob + hyper_prior_log_prob)
+            loss = -(log_likelihood + prior_log_prob + hyperprior_log_prob)
 
         gradients = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-        # if any(tf.reduce_any(tf.math.is_nan(grad)) for grad in gradients):
-        #     raise ValueError(
-        #         f"Gradient exploded: LL: {log_likelihood}, Prior LL: {prior_log_prob}, Hyperprior LL: {hyper_prior_log_prob}")
-
-        return probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob
+        return tf.nn.softmax(logits), log_likelihood, prior_log_prob, hyperprior_log_prob
 
     for batch, labels in train_data.take(iterations):
 
-        probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob = train_step(model, batch,
-                                                                                         tf.one_hot(labels, depth=10))
+        probabilities, log_likelihood, prior_log_prob, hyper_prior_log_prob = train_step(model, batch, labels)
 
         ckpt.step.assign_add(1)
 
