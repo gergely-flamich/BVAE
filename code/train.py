@@ -7,6 +7,9 @@ import datetime
 from sacred import Experiment
 
 from vae import VAE
+from bvae import BVAE
+
+from sghmc import SGHMC
 
 tfs = tf.summary
 tfd = tfp.distributions
@@ -20,9 +23,10 @@ def config():
     data_dir = "/scratch/gf332/Misc/datasets/"
     model_base_save_dir = "/scratch/gf332/Misc/bvae_experiments"
 
-    model = "vae"
+    model = "bvae"
 
-    batch_size = 64
+    dataset_size = 60000
+    batch_size = 500
 
     # Gradient descent Optimizer
     optimizer = "adam"
@@ -30,7 +34,7 @@ def config():
     learning_rate = 1e-3
 
     # Latent dimensions of the VAE
-    latent_dim = 10
+    latent_dim = 20
 
     # Logging
     tensorboard_log_freq = 1000
@@ -45,6 +49,7 @@ def config():
 def train(model_save_dir,
           data_dir,
           model,
+          dataset_size,
 
           batch_size,
 
@@ -62,6 +67,8 @@ def train(model_save_dir,
     # -------------------------------------------------------------------------
     # Prepare the dataset
     # -------------------------------------------------------------------------
+    num_batch_per_epoch = dataset_size // batch_size
+    _log.info(f"{num_batch_per_epoch} batches per epoch!")
 
     data = tfds.load("mnist", data_dir=data_dir)
 
@@ -76,19 +83,31 @@ def train(model_save_dir,
     # Create model
     # -------------------------------------------------------------------------
 
-    model = VAE(latent_dim=latent_dim)
+    model = {
+        "vae": VAE(latent_dim=latent_dim),
+        "bvae": BVAE(latent_dim=latent_dim,
+                     prior_mode="weight_and_bias")
+    }[model]
+
     model.build(input_shape=(batch_size, 28, 28, 1))
 
     learning_rate = tf.Variable(learning_rate, dtype=tf.float32, name="learn_rate")
 
     optimizer = {
         "adam": tf.optimizers.Adam
-    }[optimizer](learning_rate=learning_rate)
+    }[optimizer](learning_rate=1e-3)
+
+    sampler = {
+        "sghmc": SGHMC(learning_rate=3e-8,
+                       data_size=dataset_size,
+                       momentum_decay=0.05)
+    }["sghmc"]
 
     ckpt = tf.train.Checkpoint(step=tf.Variable(1, dtype=tf.int64),
                                learning_rate=learning_rate,
                                model=model,
-                               optimizer=optimizer)
+                               optimizer=optimizer,
+                               sampler=sampler)
 
     manager = tf.train.CheckpointManager(ckpt, model_save_dir, max_to_keep=3)
 
@@ -110,26 +129,41 @@ def train(model_save_dir,
 
     def train_step(model, batch):
 
-        with tf.GradientTape() as tape:
+        if int(ckpt.step) % num_batch_per_epoch == 0:
+            tf.print("Resampling weight scales!")
+            model.resample_weight_prior_parameters()
+
+        with tf.GradientTape(persistent=True) as tape:
 
             reconstructions = model(batch)
 
             elbo = model.likelihood - model.kl_divergence
 
-            loss = -elbo
+            prior_log_prob = model.weight_prior_log_prob() / tf.cast(dataset_size, tf.float32)
 
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            hyperprior_log_prob = model.hyper_prior_log_prob() / tf.cast(dataset_size, tf.float32)
 
-        return reconstructions, model.likelihood, model.kl_divergence
+            encoder_loss = -elbo
+            decoder_loss = -(elbo + prior_log_prob + hyperprior_log_prob)
+
+        encoder_gradients = tape.gradient(encoder_loss, model.encoder.trainable_variables)
+        optimizer.apply_gradients(zip(encoder_gradients, model.encoder.trainable_variables))
+
+        decoder_gradients = tape.gradient(decoder_loss, model.decoder.trainable_variables)
+        sampler.apply_gradients(zip(decoder_gradients, model.decoder.trainable_variables))
+
+        del tape
+
+        return reconstructions, model.likelihood, model.kl_divergence, prior_log_prob, hyperprior_log_prob
 
     for batch in train_data:
 
         ckpt.step.assign_add(1)
 
-        reconstructions, likelihood, kl_divergence = train_step(model, batch)
+        reconstructions, likelihood, kl_divergence, prior_log_prob, hyperprior_log_prob = train_step(model, batch)
 
-        if int(ckpt.step) % tensorboard_log_freq == 0:
+        if int(ckpt.step) % num_batch_per_epoch == 0:
+
             # Save model
             save_path = manager.save()
             _log.info(f"Step {int(ckpt.step)}: Saved model to {save_path}")
@@ -140,6 +174,9 @@ def train(model_save_dir,
                 tfs.scalar(name="Likelihood", data=likelihood, step=ckpt.step)
                 tfs.scalar(name="Total_KL", data=kl_divergence, step=ckpt.step)
                 tfs.scalar(name="ELBO", data=likelihood + kl_divergence, step=ckpt.step)
+
+                tfs.scalar(name="Prior_log_prob", data=prior_log_prob, step=ckpt.step)
+                tfs.scalar(name="Hyperprior_log_prob", data=hyperprior_log_prob, step=ckpt.step)
 
                 tfs.image(name="Original", data=batch, step=ckpt.step)
                 tfs.image(name="Reconstruction", data=reconstructions, step=ckpt.step)

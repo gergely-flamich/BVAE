@@ -85,19 +85,24 @@ class MnistBNN(tf.keras.Model):
         self.prior_mode = prior_mode
 
         self.transforms = [
-            GaussianConv2DWithPrior(filters=32,
-                                    kernel_size=(5, 5),
-                                    strides=(2, 2),
-                                    prior_mode=("per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
-                                    activation=tf.nn.sigmoid,
-                                    name="conv_0"),
-            tfl.Reshape((12 * 12 * 32,)),
+            # GaussianConv2DWithPrior(filters=16,
+            #                         kernel_size=(5, 5),
+            #                         strides=(2, 2),
+            #                         prior_mode=("per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+            #                         activation=tf.nn.sigmoid,
+            #                         name="conv_0"),
+            # tfl.Reshape((12 * 12 * 16,)),
+            tfl.Reshape((28 * 28,)),
             GaussianDenseWithGammaPrior(units=100,
                                         prior_mode=self.prior_mode,
                                         activation=tf.nn.sigmoid,
+                                        alpha0=10.,
+                                        beta0=10.,
                                         name="dense_0"),
             GaussianDenseWithGammaPrior(units=10,
                                         prior_mode=self.prior_mode,
+                                        alpha0=10.,
+                                        beta0=10.,
                                         name="dense_1")
         ]
 

@@ -21,7 +21,7 @@ tfl = tf.keras.layers
 ex = Experiment("bvae_experiment", ingredients=[])
 
 # Set CPU as available physical device
-tf.config.experimental.set_visible_devices([], 'GPU')
+# tf.config.experimental.set_visible_devices([], 'GPU')
 
 
 @ex.config
@@ -33,7 +33,8 @@ def config():
 
     prior_mode = "per_unit"
 
-    overestimation_rate = 1e3
+    overestimation_rate = 1e0
+    initialization_rounds = 10
 
     batch_size = 500
     burnin_epochs = 50
@@ -62,6 +63,7 @@ def train(model_save_dir,
           prior_mode,
 
           overestimation_rate,
+          initialization_rounds,
           optimizer,
           batch_size,
           momentum_decay,
@@ -105,6 +107,7 @@ def train(model_save_dir,
                                         burnin=num_batch_per_epoch * burnin_epochs,
                                         data_size=dataset_size,
                                         overestimation_rate=overestimation_rate,
+                                        initialization_rounds=initialization_rounds,
                                         momentum_decay=momentum_decay),
         "sghmc": SGHMC(learning_rate=learning_rate,
                        data_size=dataset_size,
@@ -187,3 +190,10 @@ def train(model_save_dir,
                         tfs.scalar(name=f"avg_weight/{layer.name}", data=tf.reduce_mean(layer.kernel), step=ckpt.step)
                         tfs.scalar(name=f"max_weight/{layer.name}", data=tf.reduce_max(layer.kernel), step=ckpt.step)
                         tfs.scalar(name=f"min_weight/{layer.name}", data=tf.reduce_min(layer.kernel), step=ckpt.step)
+
+                    if isinstance(layer, GaussianDenseWithGammaPrior):
+                        tfs.scalar(name=f"weight_00/{layer.name}", data=layer.kernel[0, 0], step=ckpt.step)
+                        tfs.scalar(name=f"scale_00/{layer.name}", data=layer.kernel_scale[0, 0], step=ckpt.step)
+                        tfs.scalar(name=f"prec_00/{layer.name}",
+                                   data=layer.scale_to_prec(layer.kernel_scale[0, 0]),
+                                   step=ckpt.step)

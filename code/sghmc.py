@@ -11,7 +11,7 @@ class SGHMC(tf.optimizers.Optimizer):
     def __init__(self,
                  learning_rate,
                  data_size=1,
-                 momentum_decay=0.01,
+                 momentum_decay=0.05,
                  name="SGHMC",
                  **kwargs):
 
@@ -59,21 +59,17 @@ class SGHMC(tf.optimizers.Optimizer):
                          -self._learning_rate * scaled_grad + \
                          momentum_noise
 
-        new_variable = variable + momentum
         new_momentum = momentum + momentum_delta
+        new_variable = variable + new_momentum
 
         # Dense moment update
         if indices is None:
             # Note the minus sign on the delta argument. This is because we wish to perform gradient ascent.
-            update_ops = [
-                variable.assign(new_variable).op,
-                momentum.assign(new_momentum).op
-            ]
+            variable.assign(new_variable)
+            momentum.assign(new_momentum)
 
         else:
-            update_ops = [
-                self._resource_scatter_update(variable, indices, new_variable),
-                self._resource_scatter_update(momentum, indices, new_momentum)
-            ]
+            self._resource_scatter_update(variable, indices, new_variable),
+            self._resource_scatter_update(momentum, indices, new_momentum)
 
-        return tf.group(update_ops)
+        return []
