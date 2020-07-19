@@ -10,6 +10,9 @@ from bnn import MnistBNN
 from adaptive_sghmc import AdaptiveSGHMC
 from sghmc import SGHMC
 
+from dense_with_prior import GaussianDenseWithGammaPrior
+from conv_with_prior import GaussianConv2DWithPrior
+
 tfs = tf.summary
 tfd = tfp.distributions
 
@@ -30,7 +33,7 @@ def config():
 
     prior_mode = "per_unit"
 
-    overestimation_rate = 1e5
+    overestimation_rate = 1e3
 
     batch_size = 500
     burnin_epochs = 50
@@ -45,7 +48,7 @@ def config():
     # Logging
     tensorboard_log_freq = 100
 
-    model_save_dir = f"{model_base_save_dir}/bnn/{optimizer}"
+    model_save_dir = f"{model_base_save_dir}/bnn/{optimizer}/prior_{prior_mode}"
 
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = f"{model_save_dir}/logs/{current_time}/train"
@@ -177,3 +180,10 @@ def train(model_save_dir,
                 tfs.scalar(name="Prior_log_prob", data=prior_log_prob, step=ckpt.step)
                 tfs.scalar(name="Hyperprior_log_prob", data=hyper_prior_log_prob, step=ckpt.step)
                 tfs.scalar(name="Train_accuracy", data=accuracy, step=ckpt.step)
+
+                for layer in model.transforms:
+                    if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
+                        tfs.scalar(name=f"rate/{layer.name}", data=tf.reduce_mean(layer.kernel_rate), step=ckpt.step)
+                        tfs.scalar(name=f"avg_weight/{layer.name}", data=tf.reduce_mean(layer.kernel), step=ckpt.step)
+                        tfs.scalar(name=f"max_weight/{layer.name}", data=tf.reduce_max(layer.kernel), step=ckpt.step)
+                        tfs.scalar(name=f"min_weight/{layer.name}", data=tf.reduce_min(layer.kernel), step=ckpt.step)

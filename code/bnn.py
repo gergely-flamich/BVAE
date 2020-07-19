@@ -2,6 +2,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from dense_with_prior import GaussianDenseWithGammaPrior
+from conv_with_prior import GaussianConv2DWithPrior
 
 tfd = tfp.distributions
 tfl = tf.keras.layers
@@ -84,40 +85,51 @@ class MnistBNN(tf.keras.Model):
         self.prior_mode = prior_mode
 
         self.transforms = [
-            tfl.Reshape((28 * 28,)),
+            GaussianConv2DWithPrior(filters=32,
+                                    kernel_size=(5, 5),
+                                    strides=(2, 2),
+                                    prior_mode=("per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+                                    activation=tf.nn.sigmoid,
+                                    name="conv_0"),
+            tfl.Reshape((12 * 12 * 32,)),
             GaussianDenseWithGammaPrior(units=100,
                                         prior_mode=self.prior_mode,
-                                        activation=tf.nn.sigmoid),
+                                        activation=tf.nn.sigmoid,
+                                        name="dense_0"),
             GaussianDenseWithGammaPrior(units=10,
-                                        prior_mode=self.prior_mode)
+                                        prior_mode=self.prior_mode,
+                                        name="dense_1")
         ]
 
     def resample_weight_prior_parameters(self):
 
-        for layer in self.transforms[1:]:
-            layer.resample_precisions()
+        for layer in self.transforms:
+            if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
+                layer.resample_precisions()
 
     def weight_prior_log_prob(self):
 
         prior_log_prob = 0.
         num_params = 0
 
-        for layer in self.transforms[1:]:
-            prior_log_prob += layer.weight_log_prob()
-            num_params += layer.num_params
+        for layer in self.transforms:
+            if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
+                prior_log_prob += layer.weight_log_prob()
+                num_params += layer.num_params
 
-        return prior_log_prob / tf.cast(num_params, tf.float32)
+        return prior_log_prob #/ tf.cast(num_params, tf.float32)
 
     def hyper_prior_log_prob(self):
 
-        hyperprior_log_prob = self.transforms[1].hyper_prior_log_prob()
+        hyperprior_log_prob = 0.
         num_params = 0
 
-        for layer in self.transforms[1:]:
-            hyperprior_log_prob += layer.hyper_prior_log_prob()
-            num_params += layer.num_params
+        for layer in self.transforms:
+            if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
+                hyperprior_log_prob += layer.hyper_prior_log_prob()
+                num_params += layer.num_params
 
-        return hyperprior_log_prob / tf.cast(num_params, tf.float32)
+        return hyperprior_log_prob #/ tf.cast(num_params, tf.float32)
 
     def get_weights(self):
         return [var.value() for var in self.trainable_variables]

@@ -4,24 +4,31 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 
 
-class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
+class GaussianConv2DWithPrior(tf.keras.layers.Conv2D):
     _AVAILABLE_PRIOR_MODES = [
         "per_param",
         "weight_and_bias",
-        "per_unit"
+        "per_filter"
     ]
 
     def __init__(self,
-                 units,
+                 filters,
+                 kernel_size,
                  prior_mode,
                  alpha0=1.,
                  beta0=1.,
+                 strides=(1, 1),
+                 padding='valid',
                  activation=None,
                  use_bias=True,
-                 name="gaussian_dense_with_prior",
-                 **kwargs):
+                 name="gaussian_conv2d",
+                 **kwargs,
+                 ):
 
-        super().__init__(units=units,
+        super().__init__(filters=filters,
+                         kernel_size=kernel_size,
+                         strides=strides,
+                         padding=padding,
                          activation=activation,
                          use_bias=use_bias,
                          name=name,
@@ -54,7 +61,7 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
         log_prob = tf.reduce_sum(self.kernel_prec_hyper_prior.log_prob(self.scale_to_prec(self.kernel_scale)))
 
         if self.use_bias:
-            if self.prior_mode == "per_unit":
+            if self.prior_mode == "per_filter":
                 bias_hyperprior = self.kernel_prec_hyper_prior
             else:
                 bias_hyperprior = self.bias_prec_hyper_prior
@@ -92,10 +99,12 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
                 bias_conc = self.alpha0 + tf.cast(tf.size(self.bias), self.bias.dtype) / 2.
                 bias_rate = self.beta0 + tf.reduce_sum(tf.square(self.bias)) / 2.
 
-        elif self.prior_mode == "per_unit":
+        elif self.prior_mode == "per_filter":
 
-            conc = self.alpha0 + tf.cast(self.kernel.shape[0], self.kernel.dtype) / 2.
-            rate = self.beta0 + tf.reduce_sum(tf.square(self.kernel), axis=0) / 2.
+            n_elems_per_filter = tf.reduce_prod(self.kernel.shape[:-1])
+
+            conc = self.alpha0 + tf.cast(n_elems_per_filter, self.kernel.dtype) / 2.
+            rate = self.beta0 + tf.reduce_sum(tf.square(self.kernel), axis=[0, 1, 2]) / 2.
 
             if self.use_bias:
                 conc = conc + 0.5
@@ -104,7 +113,7 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
                 bias_conc = tf.ones_like(self.bias) * conc
                 bias_rate = rate
 
-            kernel_conc = tf.ones(self.units) * conc
+            kernel_conc = tf.ones(self.filters) * conc
             kernel_rate = rate
 
         else:
@@ -113,7 +122,7 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
         self.kernel_conc.assign(kernel_conc)
         self.kernel_rate.assign(kernel_rate)
 
-        if self.use_bias and self.prior_mode != "per_unit":
+        if self.use_bias and self.prior_mode != "per_filter":
             self.bias_conc.assign(bias_conc)
             self.bias_rate.assign(bias_rate)
 
@@ -122,8 +131,8 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
 
         if self.prior_mode == "per_param":
             assigned_new_kernel_scale = new_kernel_scale
-        elif self.prior_mode == "per_unit":
-            assigned_new_kernel_scale = tf.ones([self.kernel.shape[0], 1]) * new_kernel_scale[None, :]
+        elif self.prior_mode == "per_filter":
+            assigned_new_kernel_scale = tf.ones(self.kernel.shape[:-1] + [1]) * new_kernel_scale[None, :]
         elif self.prior_mode == "weight_and_bias":
             assigned_new_kernel_scale = tf.ones_like(self.kernel) * new_kernel_scale
         else:
@@ -133,15 +142,15 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
 
         if self.use_bias:
 
-            if self.prior_mode != "per_unit":
+            if self.prior_mode != "per_filter":
                 new_bias_scale = self.prec_to_scale(self.bias_prec_hyper_prior.sample())
 
             if self.prior_mode == "per_param":
                 pass
-            elif self.prior_mode == "per_unit":
+            elif self.prior_mode == "per_filter":
                 new_bias_scale = new_kernel_scale
             elif self.prior_mode == "weight_and_bias":
-                new_bias_scale = tf.ones(self.units) * new_bias_scale
+                new_bias_scale = tf.ones(self.filters) * new_bias_scale
             else:
                 raise NotImplementedError
 
@@ -153,7 +162,7 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
 
         kernel_hyperprior_shape = {
             "per_param": self.kernel.shape,
-            "per_unit": (self.units, ),
+            "per_filter": (self.filters,),
             "weight_and_bias": (),
         }[self.prior_mode]
 
@@ -194,17 +203,16 @@ class GaussianDenseWithGammaPrior(tf.keras.layers.Dense):
 
             self.bias_scale = self.add_weight(
                 'bias_scale',
-                shape=[self.units, ],
+                shape=[self.filters, ],
                 initializer=tf.constant_initializer(value=scale_init),
                 regularizer=None,
                 constraint=None,
                 dtype=self.dtype,
                 trainable=False)
 
-            if self.prior_mode != "per_unit":
-
+            if self.prior_mode != "per_filter":
                 bias_hyperprior_shape = {
-                    "per_param": (self.units, ),
+                    "per_param": (self.filters,),
                     "weight_and_bias": (),
                 }[self.prior_mode]
 
