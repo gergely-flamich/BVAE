@@ -7,7 +7,7 @@ import datetime
 from sacred import Experiment
 
 from bnn import MnistBNN
-from adaptive_sghmc import AdaptiveSGHMC
+from adaptive_sghmc_v2 import AdaptiveSGHMC
 from sghmc import SGHMC
 
 from dense_with_prior import GaussianDenseWithGammaPrior
@@ -108,7 +108,7 @@ def train(model_save_dir,
                                         data_size=dataset_size,
                                         overestimation_rate=overestimation_rate,
                                         initialization_rounds=initialization_rounds,
-                                        momentum_decay=momentum_decay),
+                                        friction=momentum_decay),
         "sghmc": SGHMC(learning_rate=learning_rate,
                        data_size=dataset_size,
                        momentum_decay=momentum_decay)

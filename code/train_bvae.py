@@ -10,6 +10,10 @@ from vae import VAE
 from bvae import BVAE
 
 from sghmc import SGHMC
+from adaptive_sghmc import AdaptiveSGHMC
+
+from dense_with_prior import GaussianDenseWithGammaPrior
+from conv_with_prior import GaussianConv2DWithPrior, GaussianConv2DTransposeWithPrior
 
 tfs = tf.summary
 tfd = tfp.distributions
@@ -100,8 +104,15 @@ def train(model_save_dir,
     sampler = {
         "sghmc": SGHMC(learning_rate=3e-8,
                        data_size=dataset_size,
-                       momentum_decay=0.05)
-    }["sghmc"]
+                       momentum_decay=0.05),
+
+        "adaptive_sghmc": AdaptiveSGHMC(learning_rate=1e-3,
+                                        burnin=num_batch_per_epoch * 50,
+                                        data_size=dataset_size,
+                                        overestimation_rate=1,
+                                        initialization_rounds=10,
+                                        momentum_decay=0.05),
+    }["adaptive_sghmc"]
 
     ckpt = tf.train.Checkpoint(step=tf.Variable(1, dtype=tf.int64),
                                learning_rate=learning_rate,
@@ -120,6 +131,8 @@ def train(model_save_dir,
     # Training Loop
     # -------------------------------------------------------------------------
 
+    anneal_epochs = 100
+
     # Restore previous session
     ckpt.restore(manager.latest_checkpoint)
     if manager.latest_checkpoint:
@@ -127,7 +140,8 @@ def train(model_save_dir,
     else:
         _log.info("Initializing model from scratch.")
 
-    def train_step(model, batch):
+    @tf.function
+    def train_step(model, batch, beta):
 
         if int(ckpt.step) % num_batch_per_epoch == 0:
             tf.print("Resampling weight scales!")
@@ -137,7 +151,7 @@ def train(model_save_dir,
 
             reconstructions = model(batch)
 
-            elbo = model.likelihood - model.kl_divergence
+            elbo = model.likelihood - beta * model.kl_divergence
 
             prior_log_prob = model.weight_prior_log_prob() / tf.cast(dataset_size, tf.float32)
 
@@ -154,13 +168,17 @@ def train(model_save_dir,
 
         del tape
 
-        return reconstructions, model.likelihood, model.kl_divergence, prior_log_prob, hyperprior_log_prob
+        individual_kls = tf.reduce_mean(tfd.kl_divergence(model.posterior, model.prior), axis=0)
+
+        return reconstructions, model.likelihood, model.kl_divergence, prior_log_prob, hyperprior_log_prob, individual_kls
 
     for batch in train_data:
 
         ckpt.step.assign_add(1)
 
-        reconstructions, likelihood, kl_divergence, prior_log_prob, hyperprior_log_prob = train_step(model, batch)
+        beta = tf.minimum((1. / tf.cast(anneal_epochs * num_batch_per_epoch, tf.float32)) * tf.cast(ckpt.step, tf.float32), 1.)
+
+        reconstructions, likelihood, kl_divergence, prior_log_prob, hyperprior_log_prob, individual_kls = train_step(model, batch, beta)
 
         if int(ckpt.step) % num_batch_per_epoch == 0:
 
@@ -168,12 +186,12 @@ def train(model_save_dir,
             save_path = manager.save()
             _log.info(f"Step {int(ckpt.step)}: Saved model to {save_path}")
 
-            individual_kls = tf.reduce_mean(tfd.kl_divergence(model.posterior, model.prior), axis=0)
 
             with summary_writer.as_default():
                 tfs.scalar(name="Likelihood", data=likelihood, step=ckpt.step)
                 tfs.scalar(name="Total_KL", data=kl_divergence, step=ckpt.step)
-                tfs.scalar(name="ELBO", data=likelihood + kl_divergence, step=ckpt.step)
+                tfs.scalar(name="ELBO", data=likelihood - kl_divergence, step=ckpt.step)
+                tfs.scalar(name="Beta", data=beta, step=ckpt.step)
 
                 tfs.scalar(name="Prior_log_prob", data=prior_log_prob, step=ckpt.step)
                 tfs.scalar(name="Hyperprior_log_prob", data=hyperprior_log_prob, step=ckpt.step)
@@ -183,6 +201,20 @@ def train(model_save_dir,
 
                 for i, kl in enumerate(individual_kls):
                     tfs.scalar(f"KL/dim_{i}", data=kl, step=ckpt.step)
+
+                for layer in model.decoder.transforms:
+                    if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior, GaussianConv2DTransposeWithPrior)):
+                        tfs.scalar(name=f"rate/{layer.name}", data=tf.reduce_mean(layer.kernel_rate), step=ckpt.step)
+                        tfs.scalar(name=f"avg_weight/{layer.name}", data=tf.reduce_mean(layer.kernel), step=ckpt.step)
+                        tfs.scalar(name=f"max_weight/{layer.name}", data=tf.reduce_max(layer.kernel), step=ckpt.step)
+                        tfs.scalar(name=f"min_weight/{layer.name}", data=tf.reduce_min(layer.kernel), step=ckpt.step)
+
+                    if isinstance(layer, GaussianDenseWithGammaPrior):
+                        tfs.scalar(name=f"weight_00/{layer.name}", data=layer.kernel[0, 0], step=ckpt.step)
+                        tfs.scalar(name=f"scale_00/{layer.name}", data=layer.kernel_scale[0, 0], step=ckpt.step)
+                        tfs.scalar(name=f"prec_00/{layer.name}",
+                                   data=layer.scale_to_prec(layer.kernel_scale[0, 0]),
+                                   step=ckpt.step)
 
 
 

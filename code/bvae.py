@@ -90,21 +90,21 @@ class Decoder(tfl.Layer):
                                              strides=(1, 1),
                                              prior_mode=("per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
                                              padding="same",
-                                             name="conv_0"),
+                                             name="deconv_0"),
             GaussianConv2DTransposeWithPrior(filters=16,
                                              kernel_size=(5, 5),
                                              strides=2,
                                              padding="same",
                                              prior_mode=(
                                                  "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
-                                             name=""),
+                                             name="deconv_1"),
             GaussianConv2DTransposeWithPrior(filters=1,
                                              kernel_size=(5, 5),
                                              strides=2,
                                              padding="same",
                                              prior_mode=(
                                                  "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
-                                             name=""),
+                                             name="deconv_2"),
         ]
 
         super().build(input_shape)
