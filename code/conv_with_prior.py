@@ -65,6 +65,7 @@ class ConvWithPrior(abc.ABC):
 
     def _resample_precisions(self, per_filter_rate_sum_axes):
 
+
         per_filter_kernel_scale_reshape = [(1 if i in per_filter_rate_sum_axes else self.filters)
                                            for i in range(4)]
 
@@ -259,6 +260,7 @@ class GaussianConv2DWithPrior(tf.keras.layers.Conv2D, ConvWithPrior):
                                beta0=beta0)
 
     def resample_precisions(self):
+
         self._resample_precisions(per_filter_rate_sum_axes=[0, 1, 2])
 
     def build(self, input_shape, scale_init=0.1):

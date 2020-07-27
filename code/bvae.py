@@ -1,58 +1,67 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from conv_with_prior import GaussianConv2DWithPrior, GaussianConv2DTransposeWithPrior
+from conv_with_prior import GaussianConv2DWithPrior, GaussianConv2DTransposeWithPrior, ConvWithPrior
 from dense_with_prior import GaussianDenseWithGammaPrior
 
 tfl = tf.keras.layers
 tfd = tfp.distributions
 
+
 class Encoder(tfl.Layer):
 
-    def __init__(self, latent_dim, dim_h=25, name="encoder", *args, **kwargs):
-
+    def __init__(self, prior_mode, latent_dim, dim_h=25, name="encoder", *args, **kwargs):
         super().__init__(name=name, *args, **kwargs)
 
         self.latent_dim = latent_dim
         self.dim_h = dim_h
 
-    def build(self, input_shape):
+        self.prior_mode = prior_mode
 
+    def build(self, input_shape):
         self.transforms = [
-            tfl.Conv2D(filters=16,
-                       kernel_size=(5, 5),
-                       strides=2,
-                       padding="same",
-                       activation=tf.nn.relu,
-                       name="conv_0"),
-            tfl.Conv2D(filters=32,
-                       kernel_size=(5, 5),
-                       strides=2,
-                       padding="same",
-                       activation=tf.nn.relu,
-                       name="conv_1"),
-            tfl.Conv2D(filters=32,
-                       kernel_size=(3, 3),
-                       strides=1,
-                       padding="same",
-                       activation=tf.nn.relu,
-                       name="conv_2"),
+            GaussianConv2DWithPrior(filters=16,
+                                    kernel_size=(5, 5),
+                                    strides=2,
+                                    padding="same",
+                                    activation=tf.nn.relu,
+                                    prior_mode=(
+                                        "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+                                    name="conv_0"),
+            GaussianConv2DWithPrior(filters=32,
+                                    kernel_size=(5, 5),
+                                    strides=2,
+                                    padding="same",
+                                    activation=tf.nn.relu,
+                                    prior_mode=(
+                                        "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+                                    name="conv_1"),
+            GaussianConv2DWithPrior(filters=32,
+                                    kernel_size=(3, 3),
+                                    strides=1,
+                                    padding="same",
+                                    activation=tf.nn.relu,
+                                    prior_mode=(
+                                        "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+                                    name="conv_2"),
             tfl.Reshape(target_shape=(7 * 7 * 32,)),
-            tfl.Dense(units=self.dim_h,
-                      activation=tf.nn.relu,
-                      name="dense_0"),
+            GaussianDenseWithGammaPrior(units=self.dim_h,
+                                        activation=tf.nn.relu,
+                                        prior_mode=self.prior_mode,
+                                        name="dense_0"),
         ]
 
-        self.loc_head = tfl.Dense(units=self.latent_dim,
-                                  name="dense_loc")
-        self.scale_head = tfl.Dense(units=self.latent_dim,
-                                    activation=tf.nn.softplus,
-                                    name="dense_scale")
+        self.loc_head = GaussianDenseWithGammaPrior(units=self.latent_dim,
+                                                    prior_mode=self.prior_mode,
+                                                    name="dense_loc")
+        self.scale_head = GaussianDenseWithGammaPrior(units=self.latent_dim,
+                                                      prior_mode=self.prior_mode,
+                                                      activation=tf.nn.softplus,
+                                                      name="dense_scale")
 
         super().build(input_shape)
 
     def call(self, inputs, **kwargs):
-
         tensor = inputs
 
         for layer in self.transforms:
@@ -67,14 +76,12 @@ class Encoder(tfl.Layer):
 class Decoder(tfl.Layer):
 
     def __init__(self, prior_mode, name="decoder", dim_h=25, *args, **kwargs):
-
         super().__init__(name=name, *args, **kwargs)
 
         self.dim_h = dim_h
         self.prior_mode = prior_mode
 
     def build(self, input_shape):
-
         self.transforms = [
             GaussianDenseWithGammaPrior(units=self.dim_h,
                                         activation=tf.nn.relu,
@@ -88,7 +95,8 @@ class Decoder(tfl.Layer):
             GaussianConv2DTransposeWithPrior(filters=32,
                                              kernel_size=(3, 3),
                                              strides=(1, 1),
-                                             prior_mode=("per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
+                                             prior_mode=(
+                                                 "per_filter" if self.prior_mode == "per_unit" else self.prior_mode),
                                              padding="same",
                                              name="deconv_0"),
             GaussianConv2DTransposeWithPrior(filters=16,
@@ -110,7 +118,6 @@ class Decoder(tfl.Layer):
         super().build(input_shape)
 
     def call(self, inputs, **kwargs):
-
         tensor = inputs
 
         for layer in self.transforms:
@@ -128,7 +135,9 @@ class BVAE(tf.keras.Model):
         self.latent_dim = latent_dim
         self.prior_mode = prior_mode
 
-        self.encoder = Encoder(latent_dim=self.latent_dim)
+        self.encoder = Encoder(latent_dim=self.latent_dim,
+                               prior_mode=prior_mode)
+
         self.decoder = Decoder(prior_mode=self.prior_mode)
 
         self.prior_mean = tf.Variable(tf.zeros(latent_dim), name="prior_mean")
@@ -136,30 +145,52 @@ class BVAE(tf.keras.Model):
 
         self.prior = tfd.Normal(loc=self.prior_mean, scale=self.prior_scale)
 
-    def resample_weight_prior_parameters(self):
+    def resample_weight_prior_parameters(self, kind):
 
-        for layer in self.decoder.transforms:
-            if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
+        if kind == "encoder":
+            transforms = self.encoder.transforms
+        elif kind == "decoder":
+            transforms = self.decoder.transforms
+        else:
+            raise NotImplementedError
+
+        for layer in transforms:
+            if isinstance(layer, (GaussianDenseWithGammaPrior,
+                                  ConvWithPrior)):
                 layer.resample_precisions()
 
-    def weight_prior_log_prob(self):
+    def weight_prior_log_prob(self, kind):
+
+        if kind == "encoder":
+            transforms = self.encoder.transforms
+        elif kind == "decoder":
+            transforms = self.decoder.transforms
+        else:
+            raise NotImplementedError
 
         prior_log_prob = 0.
         num_params = 0
 
-        for layer in self.decoder.transforms:
+        for layer in transforms:
             if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
                 prior_log_prob += layer.weight_log_prob()
                 num_params += layer.num_params
 
-        return prior_log_prob  # / tf.cast(num_params, tf.float32)
+        return prior_log_prob
 
-    def hyper_prior_log_prob(self):
+    def hyper_prior_log_prob(self, kind):
+
+        if kind == "encoder":
+            transforms = self.encoder.transforms
+        elif kind == "decoder":
+            transforms = self.decoder.transforms
+        else:
+            raise NotImplementedError
 
         hyperprior_log_prob = 0.
         num_params = 0
 
-        for layer in self.decoder.transforms:
+        for layer in transforms:
             if isinstance(layer, (GaussianDenseWithGammaPrior, GaussianConv2DWithPrior)):
                 hyperprior_log_prob += layer.hyper_prior_log_prob()
                 num_params += layer.num_params
