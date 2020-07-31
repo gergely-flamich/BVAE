@@ -8,6 +8,10 @@ tfl = tf.keras.layers
 tfd = tfp.distributions
 
 
+def bernoulli_log_prob(mean, observation, eps=1e-7):
+    return observation * tf.math.log(mean + eps) + (1. - observation) * tf.math.log(1. - mean + eps)
+
+
 class Encoder(tfl.Layer):
 
     def __init__(self, prior_mode, latent_dim, dim_h=25, name="encoder", *args, **kwargs):
@@ -128,9 +132,24 @@ class Decoder(tfl.Layer):
 
 class BVAE(tf.keras.Model):
 
-    def __init__(self, latent_dim, prior_mode="weigth_and_bias", name="bvae", *args, **kwargs):
+    _AVAILABLE_LIKELIHOODS = [
+        "bernoulli",
+        "gaussian"
+    ]
+
+    def __init__(self,
+                 latent_dim,
+                 likelihood="gaussian",
+                 prior_mode="weigth_and_bias",
+                 name="bvae",
+                 *args, **kwargs):
 
         super().__init__(name=name, *args, **kwargs)
+
+        if likelihood not in self._AVAILABLE_LIKELIHOODS:
+            raise ValueError(f"Likelihood must be one of {self._AVAILABLE_LIKELIHOODS}, but {likelihood} was given!")
+
+        self.likelihood = likelihood
 
         self.latent_dim = latent_dim
         self.prior_mode = prior_mode
@@ -144,6 +163,9 @@ class BVAE(tf.keras.Model):
         self.prior_scale = tf.Variable(tf.ones(latent_dim), name="prior_scale")
 
         self.prior = tfd.Normal(loc=self.prior_mean, scale=self.prior_scale)
+
+        if self.likelihood == "gaussian":
+            self.likelihood_log_scale = tf.Variable(0., name="likelihood_log_scale")
 
     def resample_weight_prior_parameters(self, kind):
 
@@ -197,6 +219,10 @@ class BVAE(tf.keras.Model):
 
         return hyperprior_log_prob  # / tf.cast(num_params, tf.float32)
 
+    @property
+    def data_log_likelihood(self):
+        return self._log_likelihood
+
     def call(self, tensor):
 
         posterior_loc, posterior_scale = self.encoder(tensor)
@@ -210,8 +236,18 @@ class BVAE(tf.keras.Model):
 
         reconstruction = self.decoder(latent_code)
 
-        self.likelihood_dist = tfd.Normal(loc=reconstruction, scale=1.)
-        self.likelihood = self.likelihood_dist.log_prob(tensor)
-        self.likelihood = tf.reduce_mean(tf.reduce_sum(self.likelihood, axis=[1, 2, 3]))
+        if self.likelihood == "gaussian":
+            likelihood_dist = tfd.Normal(loc=reconstruction, scale=tf.exp(self.likelihood_log_scale))
+            self._log_likelihood = likelihood_dist.log_prob(tensor)
+
+        elif self.likelihood == "bernoulli":
+            reconstruction = tf.nn.sigmoid(reconstruction)
+            self._log_likelihood = bernoulli_log_prob(mean=reconstruction,
+                                                      observation=tensor)
+
+        else:
+            raise NotImplementedError
+
+        self._log_likelihood = tf.reduce_mean(tf.reduce_sum(self._log_likelihood, axis=[1, 2, 3]))
 
         return reconstruction

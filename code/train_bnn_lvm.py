@@ -128,7 +128,7 @@ def train(model_save_dir,
     else:
         _log.info("Initializing model from scratch.")
 
-    for i in range(100000):
+    for i in range(300000):
 
         ckpt.step.assign_add(1)
 
@@ -140,7 +140,7 @@ def train(model_save_dir,
 
             reconstructions = model.decoder(latents)
 
-            lvp = tfd.LogNormal(loc=tf.math.log(1e-3), scale=0.1)
+            lvp = tfd.LogNormal(loc=tf.math.log(1e-4), scale=0.1)
             likelihood_dist = tfd.Normal(loc=reconstructions,
                                          scale=tf.exp(model.likelihood_log_scale))
 

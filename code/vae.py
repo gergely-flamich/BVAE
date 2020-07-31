@@ -4,6 +4,8 @@ tfd = tfp.distributions
 tfl = tf.keras.layers
 
 
+
+
 class Encoder(tfl.Layer):
 
     def __init__(self, latent_dim, name="encoder", *args, **kwargs):

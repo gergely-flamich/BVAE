@@ -27,8 +27,9 @@ def config():
     data_dir = "/scratch/gf332/Misc/datasets/"
     model_base_save_dir = "/scratch/gf332/Misc/bvae_experiments"
 
-    # Model options: vae, bvae-encoder, bvae-full
+    # Model options: vae, bvae-decoder, bvae-full
     model_type = "vae"
+    likelihood = "gaussian"
     prior_mode = "weight_and_bias"
 
     dataset_name = "fashion_mnist"
@@ -46,7 +47,7 @@ def config():
     # Logging
     tensorboard_log_freq = 1000
 
-    model_save_dir = f"{model_base_save_dir}/{dataset_name}/{model_type}/latent_dim_{latent_dim}"
+    model_save_dir = f"{model_base_save_dir}/{dataset_name}/{model_type}/{likelihood}_likelihood/latent_dim_{latent_dim}"
 
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = f"{model_save_dir}/logs/{current_time}/train"
@@ -56,6 +57,7 @@ def config():
 def train(model_save_dir,
           data_dir,
           model_type,
+          likelihood,
           prior_mode,
           dataset_name,
           dataset_size,
@@ -93,6 +95,7 @@ def train(model_save_dir,
     # -------------------------------------------------------------------------
 
     model = BVAE(latent_dim=latent_dim,
+                 likelihood=likelihood,
                  prior_mode=prior_mode)
 
     model.build(input_shape=(batch_size, 28, 28, 1))
@@ -101,7 +104,7 @@ def train(model_save_dir,
 
     encoder_optimizer = {
         "vae": tf.optimizers.Adam(learning_rate=1e-3),
-        "bvae-encoder": tf.optimizers.Adam(learning_rate=1e-3),
+        "bvae-decoder": tf.optimizers.Adam(learning_rate=1e-3),
         "bvae-full": AdaptiveSGHMC(learning_rate=learning_rate,
                                    burnin=num_batch_per_epoch * burnin,
                                    data_size=dataset_size,
@@ -113,7 +116,7 @@ def train(model_save_dir,
     decoder_optimizer = {
         "vae": tf.optimizers.Adam(learning_rate=1e-3),
 
-        "bvae-encoder": AdaptiveSGHMC(learning_rate=learning_rate,
+        "bvae-decoder": AdaptiveSGHMC(learning_rate=learning_rate,
                                    burnin=num_batch_per_epoch * burnin,
                                    data_size=dataset_size,
                                    overestimation_rate=1,
@@ -158,13 +161,14 @@ def train(model_save_dir,
     def train_step(model, batch, beta):
 
         if int(ckpt.step) % num_batch_per_epoch == 0:
-            tf.print("Resampling weight scales!")
 
             if model_type == "bvae-full":
                 model.resample_weight_prior_parameters(kind="encoder")
+                tf.print("Resampling encoder weight scales!")
 
-            if model_type in ["bvae-encoder", "bvae-full"]:
+            if model_type in ["bvae-decoder", "bvae-full"]:
                 model.resample_weight_prior_parameters(kind="decoder")
+                tf.print("Resampling decoder weight scales!")
 
         weight_log_probs = []
         hyperprior_log_probs = []
@@ -175,7 +179,7 @@ def train(model_save_dir,
 
             reconstructions = model(batch)
 
-            elbo = model.likelihood - beta * model.kl_divergence
+            elbo = model.data_log_likelihood - beta * model.kl_divergence
 
             encoder_loss = -elbo
             decoder_loss = -elbo
@@ -189,7 +193,7 @@ def train(model_save_dir,
 
                 encoder_loss += -(encoder_wlp + encoder_hplp)
 
-            if model_type in ["bvae-encoder", "bvae-full"]:
+            if model_type in ["bvae-decoder", "bvae-full"]:
                 decoder_wlp = model.weight_prior_log_prob(kind="decoder") / data_size
                 decoder_hplp = model.hyper_prior_log_prob(kind="decoder") / data_size
 
@@ -201,14 +205,19 @@ def train(model_save_dir,
         encoder_gradients = tape.gradient(encoder_loss, model.encoder.trainable_variables)
         encoder_optimizer.apply_gradients(zip(encoder_gradients, model.encoder.trainable_variables))
 
-        decoder_gradients = tape.gradient(decoder_loss, model.decoder.trainable_variables)
-        decoder_optimizer.apply_gradients(zip(decoder_gradients, model.decoder.trainable_variables))
+        extra_decoder_vars = []
+
+        if model.likelihood == "gaussian":
+            extra_decoder_vars = [model.likelihood_log_scale]
+
+        decoder_gradients = tape.gradient(decoder_loss, model.decoder.trainable_variables + extra_decoder_vars)
+        decoder_optimizer.apply_gradients(zip(decoder_gradients, model.decoder.trainable_variables + extra_decoder_vars))
 
         del tape
 
         individual_kls = tf.reduce_mean(tfd.kl_divergence(model.posterior, model.prior), axis=0)
 
-        return reconstructions, model.likelihood, model.kl_divergence, weight_log_probs, hyperprior_log_probs, individual_kls
+        return reconstructions, model.data_log_likelihood, model.kl_divergence, weight_log_probs, hyperprior_log_probs, individual_kls
 
     for batch in train_data:
 
@@ -216,7 +225,7 @@ def train(model_save_dir,
 
         beta = tf.minimum((1. / tf.cast(anneal_epochs * num_batch_per_epoch, tf.float32)) * tf.cast(ckpt.step, tf.float32), 1.)
 
-        reconstructions, likelihood, kl_divergence, prior_log_probs, hyperprior_log_probs, individual_kls = train_step(model, batch, beta)
+        reconstructions, log_likelihood, kl_divergence, prior_log_probs, hyperprior_log_probs, individual_kls = train_step(model, batch, beta)
 
         if int(ckpt.step) % num_batch_per_epoch == 0:
 
@@ -225,9 +234,9 @@ def train(model_save_dir,
             _log.info(f"Step {int(ckpt.step)}: Saved model to {save_path}")
 
             with summary_writer.as_default():
-                tfs.scalar(name="Likelihood", data=likelihood, step=ckpt.step)
+                tfs.scalar(name="Likelihood", data=log_likelihood, step=ckpt.step)
                 tfs.scalar(name="Total_KL", data=kl_divergence, step=ckpt.step)
-                tfs.scalar(name="ELBO", data=likelihood - kl_divergence, step=ckpt.step)
+                tfs.scalar(name="ELBO", data=log_likelihood - kl_divergence, step=ckpt.step)
                 tfs.scalar(name="Beta", data=beta, step=ckpt.step)
 
                 for name, prior_log_prob in prior_log_probs:
@@ -238,6 +247,9 @@ def train(model_save_dir,
 
                 tfs.image(name="Original", data=batch, step=ckpt.step)
                 tfs.image(name="Reconstruction", data=reconstructions, step=ckpt.step)
+
+                if model.likelihood == "gaussian":
+                    tfs.scalar(name="Likelihood_scale", data=tf.exp(model.likelihood_log_scale), step=ckpt.step)
 
                 for i, kl in enumerate(individual_kls):
                     tfs.scalar(f"KL/dim_{i}", data=kl, step=ckpt.step)
